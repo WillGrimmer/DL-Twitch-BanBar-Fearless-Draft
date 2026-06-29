@@ -7,11 +7,19 @@ See README.md for setup and usage.
 import tkinter as tk
 from tkinter import ttk
 from pathlib import Path
-from PIL import Image, ImageTk, ImageDraw
+from PIL import Image, ImageTk, ImageDraw, ImageFilter
 
 HERO_DIR = Path(__file__).parent / "HeroPortraits"
 THUMB_BASE = 120  # base thumbnail size in pixels
 ZOOM_MIN, ZOOM_MAX = 0.5, 2.0
+
+# --- BANS overlay (Option A: chroma-key for OBS) ---
+OVERLAY_W, OVERLAY_H = 1920, 1080
+CHROMA_KEY = "#0000FF"             # pure blue — keyed out in OBS; chosen via a portrait color
+                                   # scan as the color no hero portrait uses (largest margin)
+CHROMA_KEY_RGB = tuple(int(CHROMA_KEY.lstrip("#")[i:i + 2], 16) for i in (0, 2, 4))
+OVERLAY_BORDER_COLOR = "#1a1a1a"   # grey frame, matches the BANS bar styling
+OVERLAY_BORDER_THICKNESS = 45      # px border, flush to all four edges
 
 HERO_ID_MAPPINGS = {
     1: 'Infernus', 2: 'Seven', 3: 'Vindicta', 4: 'Lady Geist',
@@ -60,6 +68,42 @@ def make_rounded_glow(img, glow_padding=12, corner_radius=20, glow_color=(200, 4
     )
     out.paste(img, (pad, pad), img if img.mode == "RGBA" else None)
     return out
+
+
+def make_overlay_border(w, h, thickness,
+                        base=(26, 26, 26), highlight=(72, 72, 75), shadow=(6, 6, 6),
+                        accent=(200, 45, 45), accent_width=3, glow_radius=7):
+    """Beveled grey frame with a soft red inner accent line.
+
+    Returns a w*h RGBA image. Top/left edges catch light (lighter grey) and
+    bottom/right fall into shadow, giving a raised 3D bevel; a soft red line
+    glows along the inner edge. The interior is filled with the chroma-key
+    color so OBS removes it, leaving only the decorative border visible.
+    """
+    def lerp(a, b, t):
+        return tuple(int(round(a[i] + (b[i] - a[i]) * t)) for i in range(3))
+
+    img = Image.new("RGBA", (w, h), CHROMA_KEY_RGB + (255,))  # chroma-key interior
+    draw = ImageDraw.Draw(img)
+    span = max(thickness - 1, 1)
+    for i in range(thickness):
+        t = i / span
+        light = lerp(highlight, base, t)   # top/left: highlight -> base
+        dark = lerp(base, shadow, t)       # bottom/right: base -> shadow
+        x0, y0, x1, y1 = i, i, w - 1 - i, h - 1 - i
+        draw.line([(x0, y0), (x1, y0)], fill=light)  # top
+        draw.line([(x0, y0), (x0, y1)], fill=light)  # left
+        draw.line([(x0, y1), (x1, y1)], fill=dark)   # bottom
+        draw.line([(x1, y0), (x1, y1)], fill=dark)   # right
+
+    # Soft red inner accent line
+    accent_layer = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    rect = [thickness, thickness, w - 1 - thickness, h - 1 - thickness]
+    ImageDraw.Draw(accent_layer).rectangle(
+        rect, outline=accent + (170,), width=accent_width + glow_radius)
+    accent_layer = accent_layer.filter(ImageFilter.GaussianBlur(glow_radius))
+    ImageDraw.Draw(accent_layer).rectangle(rect, outline=accent + (255,), width=accent_width)
+    return Image.alpha_composite(img, accent_layer)
 
 
 def load_images():
@@ -154,24 +198,45 @@ def main():
         inner.update_idletasks()
         canvas.configure(scrollregion=canvas.bbox("all"))
 
-    def update_popout():
+    def update_popout(to_back=False):
         nonlocal popout_win, popout_frame
         if popout_win is not None and not popout_win.winfo_exists():
             popout_win = None
             popout_frame = None
-        if not selected_paths:
-            if popout_win is not None:
-                popout_win.destroy()
-                popout_win = None
-                popout_frame = None
-            return
         if popout_win is None:
             popout_win = tk.Toplevel(root)
-            # No overrideredirect so the window appears in the taskbar (selectable as a source)
             popout_win.title("BANS")
-            popout_win.configure(bg="#0d0d0d")
-            popout_frame = tk.Frame(popout_win, padx=8, pady=8, bg="#1a1a1a")
-            popout_frame.pack(fill=tk.BOTH, expand=True)
+            # Normal resizable window (keeps its title bar so OBS lists/title-matches it).
+            # Maximize or snap it to fill the display like any other window.
+            popout_win.geometry(f"{OVERLAY_W}x{OVERLAY_H}")
+            popout_win.configure(bg=CHROMA_KEY)
+            # Beveled grey frame with a soft red inner accent; chroma-key interior keyed out in
+            # OBS. Redrawn to match the current window size so it scales when maximized/snapped.
+            bg_label = tk.Label(popout_win, bg=CHROMA_KEY, bd=0, highlightthickness=0)
+            bg_label.place(x=0, y=0, relwidth=1, relheight=1)
+
+            def render_border(width, height):
+                img = make_overlay_border(max(width, 1), max(height, 1), OVERLAY_BORDER_THICKNESS)
+                popout_win.border_photo = ImageTk.PhotoImage(img)
+                bg_label.configure(image=popout_win.border_photo)
+
+            popout_win._resize_job = None
+
+            def on_overlay_resize(e):
+                # Debounce: redraw the border only once the window stops resizing
+                if e.widget is not popout_win:
+                    return
+                if popout_win._resize_job is not None:
+                    popout_win.after_cancel(popout_win._resize_job)
+                popout_win._resize_job = popout_win.after(
+                    120, lambda: render_border(popout_win.winfo_width(), popout_win.winfo_height()))
+
+            popout_win.bind("<Configure>", on_overlay_resize)
+            popout_win.after(10, lambda: render_border(popout_win.winfo_width(), popout_win.winfo_height()))
+            # Row container: grey panel, centered horizontally and flush against the top border
+            popout_frame = tk.Frame(popout_win, bg=OVERLAY_BORDER_COLOR)
+            popout_frame.place(relx=0.5, y=OVERLAY_BORDER_THICKNESS, anchor=tk.N)
+            popout_frame.lift()
             popout_win.photos = []
 
             def _on_drag_start(e):
@@ -186,12 +251,14 @@ def main():
                 if hasattr(popout_win, "_drag_start"):
                     popout_win._drag_start = None
 
-            for w in (popout_win, popout_frame):
+            for w in (popout_win, bg_label, popout_frame):
                 w.bind("<Button-1>", _on_drag_start)
                 w.bind("<B1-Motion>", _on_drag_motion)
                 w.bind("<ButtonRelease-1>", _on_drag_stop)
-        popout_win.lift()
-        popout_win.focus_force()
+        # On add only, send the overlay to the very back (below all windows, incl. OBS) so it
+        # never covers the grid or OBS; OBS Window Capture still grabs it while it's behind.
+        if to_back:
+            popout_win.lower()
         # Clear and rebuild row
         for w in popout_frame.winfo_children():
             w.destroy()
@@ -203,11 +270,16 @@ def main():
                 glow_img = make_rounded_glow(img, glow_padding=10, corner_radius=18, glow_color=(200, 50, 50, 55))
                 photo = ImageTk.PhotoImage(glow_img)
                 popout_win.photos.append(photo)
-                lbl = tk.Label(popout_frame, image=photo, cursor="hand2", bg="#1a1a1a")
+                lbl = tk.Label(popout_frame, image=photo, cursor="hand2", bg=OVERLAY_BORDER_COLOR)
                 lbl.pack(side=tk.LEFT, padx=4, pady=4)
                 lbl.bind("<Button-1>", lambda e, p=path: on_popout_click(p))
             except Exception:
                 pass
+        # Hide the grey panel entirely when there are no bans (leave only the border)
+        if selected_paths:
+            popout_frame.place(relx=0.5, y=OVERLAY_BORDER_THICKNESS, anchor=tk.N)
+        else:
+            popout_frame.place_forget()
 
     def on_popout_click(path):
         """Unselect: remove from popout and add back to main grid in sorted order."""
@@ -250,7 +322,7 @@ def main():
                 lbl.grid(row=i // COLS, column=i % COLS, padx=2, pady=2, sticky=tk.NW)
             # Add to selected and show in popout
             selected_paths.append(p)
-            update_popout()
+            update_popout(to_back=True)
             update_scroll_region()
         return handler
 
@@ -278,6 +350,9 @@ def main():
         canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
 
     root.bind("<MouseWheel>", on_mousewheel)
+
+    # Show the BANS overlay from the start, even before any bans are selected
+    update_popout()
 
     root.mainloop()
 
